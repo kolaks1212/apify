@@ -27,7 +27,7 @@ APIFY_TOKEN = os.getenv("APIFY_TOKEN")
 # محدودیت حجم آپلود مستقیم بات تلگرام (50 مگابایت)
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-# ۵ ابزار (Actor) قدرتمند Apify برای عبور از Cloudflare و استخراج لینک/فایل
+# ۵ ابزار (Actor) قدرتمند Apify
 APIFY_TOOLS = {
     "tool_1": {
         "name": "1️⃣ Playwright Scraper (پیشنهادی - مرورگر واقعی)",
@@ -52,6 +52,47 @@ APIFY_TOOLS = {
 }
 
 
+def get_actor_input(actor_id: str, target_url: str) -> dict:
+    """ساخت ورودی دقیق و استاندارد متناسب با هر ابزار Apify"""
+    base_input = {
+        "startUrls": [{"url": target_url}],
+        "maxRequestsPerCrawl": 1,
+        "proxyConfiguration": {"useApifyProxy": True},
+    }
+
+    # ابزار شماره 3 نیازی به pageFunction ندارد
+    if actor_id == "apify/website-content-crawler":
+        return base_input
+
+    # ابزار شماره 4 (Cheerio)
+    if actor_id == "apify/cheerio-scraper":
+        base_input["pageFunction"] = """
+        async function pageFunction(context) {
+            const { request, $ } = context;
+            return {
+                url: request.url,
+                loadedUrl: request.loadedUrl,
+                title: $('title').text()
+            };
+        }
+        """
+        return base_input
+
+    # ابزارهای مرورگر محور (Playwright, Puppeteer, Web Scraper)
+    base_input["pageFunction"] = """
+    async function pageFunction(context) {
+        const { request, page } = context;
+        const title = page ? await page.title() : 'Processed';
+        return {
+            url: request.url,
+            loadedUrl: request.loadedUrl || request.url,
+            title: title
+        };
+    }
+    """
+    return base_input
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دستور شروع ربات"""
     welcome_text = (
@@ -60,7 +101,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔗 **قابلیت‌ها:**\n"
         "1. دانلود مستقیم فایل‌ها و ویدیوها با سرعت بالا.\n"
         "2. تشخیص هوشمند فایروال و آنتی‌بات **Cloudflare**.\n"
-        "3. اتصال به ۵ ابزار قدرتمند **Apify** برای دور زدن محدودیت‌ها به انتخاب شما.\n\n"
+        "3. اتصال به ۵ ابزار قدرتمند **Apify** برای پردازش لینک به انتخاب شما.\n\n"
         "کافیست لینک مستقیم فایل یا ویدیو را برای من ارسال کنید!"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -116,7 +157,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status = response.status
                 resp_headers = response.headers
 
-                # خواندن بخش کوچکی از محتوا در صورت خطا برای بررسی کلودفلر
                 body_sample = ""
                 if status in [403, 503, 429]:
                     chunk = await response.content.read(2048)
@@ -132,7 +172,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     await status_msg.edit_text(
                         "🛡 **محافظت آنتی‌بات Cloudflare شناسایی شد!**\n\n"
-                        "دسترسی مستقیم به این لینک مسدود است. لطفاً یکی از ۵ ابزار قدرتمند **Apify** زیر را برای عبور از فایروال و پردازش لینک انتخاب کنید:",
+                        "دسترسی مستقیم به این لینک مسدود است. لطفاً یکی از ۵ ابزار قدرتمند **Apify** زیر را برای پردازش لینک انتخاب کنید:",
                         reply_markup=reply_markup,
                         parse_mode="Markdown",
                     )
@@ -169,7 +209,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 await status_msg.edit_text("📤 دانلود تمام شد! در حال آپلود به تلگرام...")
 
-                # ارسال فایل به کاربر
                 with open(file_path, "rb") as f:
                     if filename.lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
                         await update.message.reply_video(video=f, caption=f"✅ دانلود شده: `{filename}`", parse_mode="Markdown")
@@ -216,20 +255,17 @@ async def apify_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         apify_client = ApifyClientAsync(APIFY_TOKEN)
 
-        # تنظیمات ورودی استاندارد برای عبور از کلودفلر با پروکسی Apify
-        run_input = {
-            "startUrls": [{"url": target_url}],
-            "maxRequestsPerCrawl": 1,
-            "proxyConfiguration": {"useApifyProxy": True},
-        }
+        # دریافت تنظیمات ورودی متناسب با ابزار انتخاب شده
+        run_input = get_actor_input(actor_id, target_url)
 
-        # اجرای Actor انتخاب شده
+        # اجرای Actor بدون پارامتر قدیمی timeout_secs
         actor_client = apify_client.actor(actor_id)
-        call_result = await actor_client.call(run_input=run_input, timeout_secs=120)
+        call_result = await actor_client.call(run_input=run_input)
 
         if not call_result or call_result.get("status") != "SUCCEEDED":
+            status_text = call_result.get("status") if call_result else "UNKNOWN"
             await query.edit_message_text(
-                f"❌ اجرای ابزار `{actor_id}` موفقیت‌آمیز نبود. لطفاً لینک را مجدداً فرستاده و ابزار دیگری را امتحان کنید.",
+                f"❌ اجرای ابزار `{actor_id}` با وضعیت `{status_text}` متوقف شد. لطفاً ابزار دیگری را امتحان کنید.",
                 parse_mode="Markdown",
             )
             return
@@ -240,17 +276,16 @@ async def apify_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         items_result = await dataset_client.list_items()
         items = items_result.items
 
-        # بررسی اینکه آیا لینک جدید یا دیتایی استخراج شده است
-        extracted_info = f"✅ **عملیات عبور از Cloudflare با `{actor_id}` انجام شد!**\n\n"
+        extracted_info = f"✅ **پردازش با `{actor_id}` انجام شد!**\n\n"
         if items:
             first_item = items[0]
-            resolved_url = first_item.get("url") or first_item.get("loadedUrl") or target_url
-            title = first_item.get("title") or "بدون عنوان"
+            resolved_url = first_item.get("loadedUrl") or first_item.get("url") or target_url
+            title = first_item.get("title") or first_item.get("metadata", {}).get("title") or "بدون عنوان"
             extracted_info += f"📌 **عنوان صفحه/فایل:** `{title}`\n"
-            extracted_info += f"🔗 **لینک پردازش شده:**\n{resolved_url}\n\n"
-            extracted_info += "💡 در صورتی که فایل متنی یا اسنپ‌شات در دیتاست ذخیره شده باشد، می‌توانید از پنل Apify خود نیز آن را مشاهده کنید."
+            extracted_info += f"🔗 **لینک نهایی پس از پردازش:**\n{resolved_url}\n\n"
+            extracted_info += f"🗂 **شناسه دیتاست در پنل Apify شما:** `{dataset_id}`"
         else:
-            extracted_info += "نشست (Session) کلودفلر باز شد اما دیتای مستقیمی در خروجی دیتاست ثبت نشد."
+            extracted_info += f"عملیات اجرا شد. شناسه دیتاست در پنل Apify:\n`{dataset_id}`"
 
         await query.edit_message_text(extracted_info, parse_mode="Markdown")
 
@@ -268,7 +303,6 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # ثبت هندلرها
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     application.add_handler(CallbackQueryHandler(apify_button_handler))
